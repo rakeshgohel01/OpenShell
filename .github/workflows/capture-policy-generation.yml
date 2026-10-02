@@ -1,0 +1,119 @@
+# Fork-only workflow for NVIDIA/OpenShell#3840. Not part of the patch.
+#
+# Builds OpenShell from source, starts a Docker-driver gateway with locally
+# built supervisor and sandbox runtime images, runs the policy-generation
+# scenario and uploads the OCSF logs. Runs twice: once on the patched branch
+# and once with crates/ and docs/ reverted to the upstream base commit.
+
+name: Capture policy-generation OCSF logs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [capture/policy-generation]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: capture-policy-generation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # NVIDIA/OpenShell main that the patch was applied to on this branch.
+  BASE_SHA: 046fd2a0246d6765845b3abf6f9cb2c74005781f
+
+jobs:
+  capture:
+    name: Capture (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [patched, main]
+    env:
+      CAPTURE_VARIANT: ${{ matrix.variant }}
+      CARGO_INCREMENTAL: "0"
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          docker image prune -af >/dev/null || true
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Revert source to upstream base (main variant)
+        if: matrix.variant == 'main'
+        run: |
+          git fetch --no-tags https://github.com/NVIDIA/OpenShell.git "${BASE_SHA}" || true
+          git checkout "${BASE_SHA}" -- crates docs
+          git status --short
+          git diff --cached --stat HEAD | tail -5
+          if git diff --quiet "${BASE_SHA}" -- crates; then echo "crates/ matches ${BASE_SHA}"; else echo "crates/ differs from base" >&2; exit 1; fi
+
+      - name: Show applied diff (patched variant)
+        if: matrix.variant == 'patched'
+        run: git diff --stat "${BASE_SHA}" HEAD -- crates docs
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libz3-dev pkg-config clang libclang-dev jq
+
+      - uses: ./.github/actions/setup-mise
+
+      - name: Stage supervisor and sandbox binaries
+        run: |
+          mise x -- bash tasks/scripts/stage-prebuilt-binaries.sh supervisor
+          mise x -- bash tasks/scripts/stage-prebuilt-binaries.sh sandbox
+          ls -la deploy/docker/.build/prebuilt-binaries/amd64/
+
+      - name: Build supervisor, sandbox runtime and workload images
+        run: |
+          CONTAINER_ENGINE=docker DOCKER_PLATFORM=linux/amd64 IMAGE_TAG=dev mise x -- bash tasks/scripts/docker-build-image.sh supervisor
+          CONTAINER_ENGINE=docker DOCKER_PLATFORM=linux/amd64 IMAGE_TAG=dev mise x -- bash tasks/scripts/docker-build-image.sh sandbox
+          CONTAINER_ENGINE=docker mise x -- bash tasks/scripts/e2e-build-workload.sh
+          docker images | grep -E 'openshell/' || true
+          df -h /
+
+      - name: Run scenario
+        env:
+          OPENSHELL_SUPERVISOR_IMAGE: openshell/supervisor:dev
+          OPENSHELL_SANDBOX_RUNTIME_IMAGE: openshell/sandbox:dev
+          OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE: openshell/e2e-python:dev
+          OPENSHELL_E2E_DOCKER_SANDBOX_IMAGE_PULL_POLICY: if_not_present
+          CAPTURE_DIR: ${{ github.workspace }}/capture-out/${{ matrix.variant }}
+        run: |
+          mkdir -p "${CAPTURE_DIR}"
+          chmod +x .github/capture/policy-generation-scenario.sh
+          set -o pipefail
+          mise x -- e2e/with-docker-gateway.sh bash .github/capture/policy-generation-scenario.sh 2>&1 | tee "${CAPTURE_DIR}/harness.log"
+
+      - name: Summarise OCSF events
+        if: always()
+        env:
+          CAPTURE_DIR: ${{ github.workspace }}/capture-out/${{ matrix.variant }}
+        run: |
+          cd "${CAPTURE_DIR}" || exit 0
+          for d in */; do
+            [ -d "$d" ] || continue
+            for f in "$d"openshell-ocsf.*.log; do
+              [ -f "$f" ] || continue
+              echo "### $f"
+              jq -c '{time, class_name, activity_name, action, disposition, message, firewall_rule, unmapped}' "$f" 2>/dev/null || cat "$f"
+            done
+          done | tee summary.txt
+
+      - name: Upload capture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capture-${{ matrix.variant }}
+          path: capture-out/${{ matrix.variant }}
+          if-no-files-found: warn
