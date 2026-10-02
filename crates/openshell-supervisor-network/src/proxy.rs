@@ -2758,6 +2758,7 @@ async fn handle_mediated_connection(
                     &host_lc,
                     port,
                     activity_tx.as_ref(),
+                    decision.policy_generation,
                     error,
                 )
                 .await?;
@@ -2957,8 +2958,15 @@ async fn handle_mediated_connection(
     if let Err(error) =
         relay::validate_route_generation(l7_route, connect_generation_guard.captured_generation())
     {
-        reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
-            .await?;
+        reject_stale_connect_policy(
+            &mut client,
+            &host_lc,
+            port,
+            activity_tx.as_ref(),
+            decision.policy_generation,
+            error,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -2972,6 +2980,7 @@ async fn handle_mediated_connection(
             &host_lc,
             port,
             activity_tx.as_ref(),
+            decision.policy_generation,
             miette::miette!(
                 "policy changed while CONNECT was dialing upstream \
                  [captured_generation:{} current_generation:{}]",
@@ -2992,8 +3001,15 @@ async fn handle_mediated_connection(
         }
     };
     if let Err(error) = connect_generation_guard.ensure_current() {
-        reject_stale_connect_policy(&mut client, &host_lc, port, activity_tx.as_ref(), error)
-            .await?;
+        reject_stale_connect_policy(
+            &mut client,
+            &host_lc,
+            port,
+            activity_tx.as_ref(),
+            decision.policy_generation,
+            error,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -3811,19 +3827,40 @@ fn authorize_egress_intent(
     }
 }
 
-fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette::Report) {
-    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+/// `pinned_generation` is the generation the connection was authorized under,
+/// matching the L7 relay's stale-tunnel close event.
+fn emit_l7_tunnel_close_after_policy_change(
+    host: &str,
+    port: u16,
+    pinned_generation: u64,
+    error: miette::Report,
+) {
+    ocsf_emit!(build_l7_tunnel_close_after_policy_change_event(
+        host,
+        port,
+        pinned_generation,
+        &error,
+    ));
+}
+
+fn build_l7_tunnel_close_after_policy_change_event(
+    host: &str,
+    port: u16,
+    pinned_generation: u64,
+    error: &miette::Report,
+) -> openshell_ocsf::OcsfEvent {
+    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
         .severity(SeverityId::Medium)
         .status(StatusId::Failure)
         .dst_endpoint(Endpoint::from_domain(host, port))
+        .firewall_rule_at_generation("-", "opa", pinned_generation)
         .message(format!(
             "L7 tunnel closed before inspection because policy changed: {error}"
         ))
-        .build();
-    ocsf_emit!(event);
+        .build()
 }
 
 async fn reject_stale_connect_policy<C>(
@@ -3831,6 +3868,7 @@ async fn reject_stale_connect_policy<C>(
     host: &str,
     port: u16,
     activity_tx: Option<&ActivitySender>,
+    pinned_generation: u64,
     error: miette::Report,
 ) -> Result<()>
 where
@@ -3842,7 +3880,7 @@ where
         error = %error,
         "CONNECT rejected because policy changed after L4 authorization"
     );
-    emit_l7_tunnel_close_after_policy_change(host, port, error);
+    emit_l7_tunnel_close_after_policy_change(host, port, pinned_generation, error);
     emit_activity_simple(activity_tx, true, "policy_stale");
     respond(
         client,
@@ -5517,7 +5555,7 @@ async fn handle_forward_proxy(
                 error = %e,
                 "Forward proxy rejected request because policy generation changed after L4 decision"
             );
-            emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+            emit_l7_tunnel_close_after_policy_change(&host_lc, port, decision.policy_generation, e);
             emit_activity_simple(activity_tx, true, "policy_stale");
             respond(
                 client,
@@ -5639,6 +5677,7 @@ async fn handle_forward_proxy(
             emit_l7_tunnel_close_after_policy_change(
                 &host_lc,
                 port,
+                decision.policy_generation,
                 miette::miette!(
                     "policy changed before forward L7 evaluation [expected_generation:{} current_generation:{}]",
                     forward_generation_guard.captured_generation(),
@@ -5669,7 +5708,12 @@ async fn handle_forward_proxy(
                     error = %e,
                     "Forward proxy rejected request because L7 tunnel engine could not be cloned"
                 );
-                emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+                emit_l7_tunnel_close_after_policy_change(
+                    &host_lc,
+                    port,
+                    decision.policy_generation,
+                    e,
+                );
                 emit_activity_simple(activity_tx, true, "policy_stale");
                 respond(
                     client,
@@ -6168,7 +6212,7 @@ async fn handle_forward_proxy(
             error = %e,
             "Forward proxy rejected request because policy changed before upstream connect"
         );
-        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        emit_l7_tunnel_close_after_policy_change(&host_lc, port, decision.policy_generation, e);
         emit_activity_simple(activity_tx, true, "policy_stale");
         respond(
             client,
@@ -6198,6 +6242,7 @@ async fn handle_forward_proxy(
         emit_l7_tunnel_close_after_policy_change(
             &host_lc,
             port,
+            decision.policy_generation,
             miette::miette!(
                 "policy changed before forward middleware evaluation [expected_generation:{} current_generation:{}]",
                 forward_generation_guard.captured_generation(),
@@ -6481,7 +6526,7 @@ async fn handle_forward_proxy(
             error = %e,
             "Forward proxy rejected request because policy changed before relay"
         );
-        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        emit_l7_tunnel_close_after_policy_change(&host_lc, port, decision.policy_generation, e);
         if let Some(session) = middleware_session.take() {
             session
                 .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
@@ -6555,7 +6600,7 @@ async fn handle_forward_proxy(
             error = %e,
             "Forward proxy rejected request because policy changed during upstream connect"
         );
-        emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        emit_l7_tunnel_close_after_policy_change(&host_lc, port, decision.policy_generation, e);
         if let Some(session) = middleware_session.take() {
             session
                 .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
@@ -7853,6 +7898,24 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             pinned_transparent_plan(&store, mapped_destination, &reloaded),
             Err(MappingLookupError::StalePolicy)
         ));
+    }
+
+    #[test]
+    fn policy_change_close_records_the_pinned_generation() {
+        let event = build_l7_tunnel_close_after_policy_change_event(
+            "api.github.com",
+            443,
+            1,
+            &miette::miette!(
+                "policy generation is stale [captured_generation:1 current_generation:2]"
+            ),
+        );
+        let json = serde_json::to_value(event).unwrap();
+        assert_eq!(json["action"], "Denied");
+        assert_eq!(
+            json["firewall_rule"],
+            serde_json::json!({"name": "-", "type": "opa", "version": "1"})
+        );
     }
 
     #[test]
