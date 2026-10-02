@@ -92,15 +92,24 @@ collect() {
   "${OS}" policy get "${name}" --full >"${OUT}/${name}.policy-get.txt" 2>&1 \
     || "${OS}" policy get "${name}" >"${OUT}/${name}.policy-get.txt" 2>&1 || true
 
-  # Independent copy straight from the container, in case exec output is
-  # wrapped or truncated.
-  local ids id
-  ids=$(docker ps -aq --filter "label=openshell.ai/managed-by=openshell" 2>/dev/null || true)
+  # The Docker driver runs the supervisor in its own container with a
+  # read-only rootfs and /var/log on tmpfs, so neither `sandbox exec` nor
+  # `docker cp` can see the OCSF file. The runner is the Docker host, so read
+  # it through the supervisor process's root.
+  local ids id role pid dest
+  ids=$(docker ps -q --filter "label=openshell.ai/sandbox-name=${name}" 2>/dev/null || true)
   for id in ${ids}; do
-    if docker inspect "${id}" --format '{{json .Config.Labels}}' 2>/dev/null | grep -q "\"${name}\""; then
-      mkdir -p "${OUT}/${name}.container-var-log"
-      docker cp "${id}:/var/log/." "${OUT}/${name}.container-var-log/" >/dev/null 2>&1 || true
-      docker inspect "${id}" --format '{{json .Config.Labels}}' >"${OUT}/${name}.container-labels.json" 2>&1 || true
+    role=$(docker inspect "${id}" --format '{{index .Config.Labels "openshell.ai/isolation-role"}}' 2>/dev/null || echo unknown)
+    pid=$(docker inspect "${id}" --format '{{.State.Pid}}' 2>/dev/null || echo 0)
+    dest="${OUT}/${name}.${role:-unknown}-var-log"
+    mkdir -p "${dest}"
+    docker inspect "${id}" --format '{{json .Config.Labels}}' >"${dest}/labels.json" 2>&1 || true
+    if [ "${pid}" != "0" ]; then
+      sudo sh -c "ls -la /proc/${pid}/root/var/log/" >"${dest}/ls.txt" 2>&1 || true
+      for f in $(sudo sh -c "ls /proc/${pid}/root/var/log/ 2>/dev/null" | grep '^openshell'); do
+        sudo cat "/proc/${pid}/root/var/log/${f}" >"${dest}/${f}" 2>/dev/null || true
+      done
+      sudo chown -R "$(id -u):$(id -g)" "${dest}" 2>/dev/null || true
     fi
   done
 }
