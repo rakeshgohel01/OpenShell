@@ -1368,7 +1368,11 @@ fn build_transparent_tcp_allow_ocsf_event(
         ))
         .src_endpoint_addr(audit.workload.ip(), audit.workload.port())
         .actor_process(Process::from_bypass(audit.binary, audit.pid, ""))
-        .firewall_rule(audit.policy_name, "opa")
+        .firewall_rule_at_generation(
+            audit.policy_name,
+            "opa",
+            audit.authorization_policy_generation,
+        )
         .unmapped("matched_policy", audit.policy_name)
         .unmapped("normalized_domain", audit.normalized_domain)
         .unmapped("logical_destination", logical_destination)
@@ -1511,7 +1515,7 @@ fn emit_transparent_policy_denial(
             .dst_endpoint(Endpoint::from_domain(host, port))
             .src_endpoint_addr(workload.ip(), workload.port())
             .actor_process(Process::from_bypass(&binary, &pid, "-"))
-            .firewall_rule("-", "opa")
+            .firewall_rule_at_generation("-", "opa", decision.policy_generation)
             .message(format!("Transparent TCP denied {host}:{port}"))
             .status_detail(status_detail)
             .build()
@@ -1923,6 +1927,7 @@ fn build_connect_allow_ocsf_event(
     ancestors: &str,
     cmdline: &str,
     policy: &str,
+    policy_generation: u64,
     l7_inspection: bool,
 ) -> openshell_ocsf::OcsfEvent {
     let connect_msg = if l7_inspection {
@@ -1939,7 +1944,7 @@ fn build_connect_allow_ocsf_event(
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
         .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
-        .firewall_rule(policy, "opa")
+        .firewall_rule_at_generation(policy, "opa", policy_generation)
         .message(format!("{connect_msg} allowed {host}:{port}"))
         .build()
 }
@@ -1956,6 +1961,7 @@ fn build_forward_allow_ocsf_event(
     ancestors: &str,
     cmdline: &str,
     policy: &str,
+    policy_generation: u64,
 ) -> openshell_ocsf::OcsfEvent {
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::for_http_method(method))
@@ -1970,7 +1976,7 @@ fn build_forward_allow_ocsf_event(
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
         .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
-        .firewall_rule(policy, "opa")
+        .firewall_rule_at_generation(policy, "opa", policy_generation)
         .message(format!("FORWARD allowed {method} {host}:{port}{path}"))
         .build()
 }
@@ -2077,6 +2083,7 @@ fn build_forward_policy_deny_ocsf_event(
     ancestors: &str,
     cmdline: &str,
     reason: &str,
+    policy_generation: u64,
 ) -> openshell_ocsf::OcsfEvent {
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Other)
@@ -2091,7 +2098,7 @@ fn build_forward_policy_deny_ocsf_event(
         .dst_endpoint(Endpoint::from_domain(host, port))
         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
         .actor_process(Process::from_bypass(binary, pid, ancestors).with_cmd_line(cmdline))
-        .firewall_rule("-", "opa")
+        .firewall_rule_at_generation("-", "opa", policy_generation)
         .message(format!("FORWARD denied {method} {host}:{port}{path}"))
         .status_detail(reason)
         .build()
@@ -2696,7 +2703,7 @@ async fn handle_mediated_connection(
                 Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                     .with_cmd_line(&cmdline_str),
             )
-            .firewall_rule("-", "opa")
+            .firewall_rule_at_generation("-", "opa", decision.policy_generation)
             .message(format!("CONNECT denied {host_lc}:{port}"))
             .status_detail(&deny_reason)
             .build();
@@ -2993,6 +3000,7 @@ async fn handle_mediated_connection(
         &ancestors_str,
         &cmdline_str,
         policy_str,
+        decision.policy_generation,
         should_inspect_l7,
     ));
     emit_connect_activity_if_l4_only(&activity_tx, l7_route);
@@ -5440,6 +5448,7 @@ async fn handle_forward_proxy(
                 &ancestors_str,
                 &cmdline_str,
                 reason,
+                decision.policy_generation,
             ));
             emit_denial_simple(
                 denial_tx,
@@ -6018,7 +6027,11 @@ async fn handle_forward_proxy(
                     Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
                         .with_cmd_line(&cmdline_str),
                 )
-                .firewall_rule(policy_str, engine_type)
+                .firewall_rule_at_generation(
+                    policy_str,
+                    engine_type,
+                    tunnel_engine.captured_generation(),
+                )
                 .message(log_message)
                 .build();
             ocsf_emit!(event);
@@ -6635,6 +6648,7 @@ async fn handle_forward_proxy(
         &ancestors_str,
         &cmdline_str,
         policy_str,
+        decision.policy_generation,
     ));
     emit_forward_success_activity(activity_tx, l7_activity_pending);
 
@@ -9677,10 +9691,12 @@ network_policies:
             "/usr/bin/bash",
             "curl http://api.example.com/v1/models",
             reason,
+            9,
         );
         let json = event.to_json().unwrap();
 
         assert_eq!(json["status_detail"], reason);
+        assert_eq!(json["firewall_rule"]["version"], "9");
         assert_eq!(json["action"], "Denied");
         assert_eq!(json["disposition"], "Blocked");
     }
@@ -9753,6 +9769,7 @@ network_policies:
         assert!(json["actor"]["process"].get("parent_process").is_none());
         assert_eq!(json["dst_endpoint"]["domain"], "redis.openshell.demo");
         assert_eq!(json["firewall_rule"]["name"], "redis");
+        assert_eq!(json["firewall_rule"]["version"], "7");
         assert_eq!(json["unmapped"]["synthetic_destination"], "198.18.0.7:6379");
         assert_eq!(
             json["unmapped"]["connected_real_destination"],
@@ -9872,6 +9889,7 @@ network_policies:
             "/usr/bin/bash",
             "curl",
             "allow_api",
+            3,
         )
         .to_json()
         .unwrap();
@@ -9886,10 +9904,12 @@ network_policies:
             "/usr/bin/bash",
             "curl",
             "policy denied",
+            3,
         )
         .to_json()
         .unwrap();
         for event in [&allowed, &denied] {
+            assert_eq!(event["firewall_rule"]["version"], "3");
             assert_eq!(event["http_request"]["url"]["path"], "/v1/[CREDENTIAL]");
             let serialized = event.to_string();
             assert!(!serialized.contains("API_TOKEN"), "{serialized}");
@@ -9912,6 +9932,7 @@ network_policies:
             "/usr/bin/bash",
             "curl",
             "allow_api",
+            3,
         )
         .to_json()
         .unwrap();
