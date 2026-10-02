@@ -105,6 +105,23 @@ collect() {
   done
 }
 
+# A long-running workload keeps the sandbox Ready; `-- echo` would complete it.
+create_sandbox() {
+  local name=$1 i
+  run "${OS}" sandbox create --name "${name}" --policy "${QUICKSTART}" \
+    --no-auto-providers --no-tty --detach -- sh -c "exec sleep infinity" || return 1
+  for i in $(seq 1 60); do
+    if "${OS}" sandbox exec --name "${name}" --no-tty --no-login-shell -- true >/dev/null 2>&1; then
+      note "${name} ready after ~$((i * 2))s"
+      return 0
+    fi
+    sleep 2
+  done
+  note "${name} did not become ready"
+  run "${OS}" sandbox get "${name}"
+  return 1
+}
+
 note "variant: ${CAPTURE_VARIANT:-unknown}  commit: $(git rev-parse HEAD)"
 run "${OS}" --version
 
@@ -113,8 +130,7 @@ run "${OS}" settings set --global --key ocsf_json_enabled --value true --yes
 
 # ---------------------------------------------------------------- Phase A
 note "A: create sandbox policygen with the quickstart policy"
-run "${OS}" sandbox create --name policygen --policy "${QUICKSTART}" \
-  --no-auto-providers --no-tty -- echo ready || exit 1
+create_sandbox policygen || exit 1
 
 # The setting is applied on the supervisor's next poll (10 s by default).
 note "A: wait for the settings poll so JSON export is on"
@@ -139,8 +155,7 @@ collect policygen
 
 # ---------------------------------------------------------------- Phase B
 note "B: create sandbox policygen-race with the quickstart policy"
-if run "${OS}" sandbox create --name policygen-race --policy "${QUICKSTART}" \
-  --no-auto-providers --no-tty -- echo ready; then
+if create_sandbox policygen-race; then
   sleep 25
   note "B: start a curl loop inside the sandbox, then reload while it runs"
   "${OS}" sandbox exec --name policygen-race --no-tty --no-login-shell -- \
