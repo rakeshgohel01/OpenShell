@@ -647,6 +647,7 @@ async fn preauthorize_transparent_open(
                 &binary_identity,
                 "sandbox-local policy API requires port 80 and an active context",
                 "transparent_tcp_policy_local_invalid_destination",
+                None,
             );
             let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
             return None;
@@ -671,6 +672,7 @@ async fn preauthorize_transparent_open(
                 &binary_identity,
                 "sandbox-local policy API requires a verified workload identity",
                 "transparent_tcp_policy_local_identity_unavailable",
+                None,
             );
             let _ = completion.send(TcpOpenDecision::Denied(denial));
             return None;
@@ -699,6 +701,7 @@ async fn preauthorize_transparent_open(
                     &binary_identity,
                     &error.to_string(),
                     "transparent_tcp_mapping_denied",
+                    None,
                 );
                 let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
                 return None;
@@ -712,6 +715,7 @@ async fn preauthorize_transparent_open(
         &binary_identity,
     );
     let mut decision = supplied_authorization.decision;
+    let policy_generation = decision.policy_generation;
     if let NetworkAction::Deny { reason } = &decision.action {
         let (denial, status_detail) = supplied_authorization.denial.map_or(
             (TcpOpenDenial::PolicyDenied, "transparent_tcp_policy_denied"),
@@ -733,6 +737,7 @@ async fn preauthorize_transparent_open(
             &binary_identity,
             reason,
             status_detail,
+            Some(policy_generation),
         );
         if supplied_authorization.denial.is_none()
             && !is_always_blocked_ip(destination.ip())
@@ -785,6 +790,7 @@ async fn preauthorize_transparent_open(
                     &binary_identity,
                     &reason,
                     status_detail,
+                    Some(policy_generation),
                 );
                 let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
                 return None;
@@ -801,6 +807,7 @@ async fn preauthorize_transparent_open(
             &binary_identity,
             &denial.reason,
             "transparent_tcp_destination_denied",
+            Some(policy_generation),
         );
         let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
         return None;
@@ -830,6 +837,7 @@ async fn preauthorize_transparent_open(
                 &binary_identity,
                 &denial.reason,
                 "transparent_tcp_destination_denied",
+                Some(policy_generation),
             );
             let _ = completion.send(TcpOpenDecision::Denied(TcpOpenDenial::InvalidDestination));
             return None;
@@ -849,12 +857,15 @@ async fn preauthorize_transparent_open(
     ))
 }
 
+/// `policy_generation` is the generation of the egress decision that denied
+/// the open, or `None` when the open failed before policy evaluation.
 fn emit_staged_transparent_denial(
     destination: SocketAddr,
     mapped_host: Option<&str>,
     identity: &Result<ContractBinaryIdentity, ResolveError>,
     reason: &str,
     status_detail: &'static str,
+    policy_generation: Option<u64>,
 ) {
     ocsf_emit!(build_staged_transparent_denial_event(
         destination,
@@ -862,6 +873,7 @@ fn emit_staged_transparent_denial(
         identity,
         reason,
         status_detail,
+        policy_generation,
     ));
 }
 
@@ -871,6 +883,7 @@ fn build_staged_transparent_denial_event(
     identity: &Result<ContractBinaryIdentity, ResolveError>,
     reason: &str,
     status_detail: &'static str,
+    policy_generation: Option<u64>,
 ) -> openshell_ocsf::OcsfEvent {
     let (binary, ancestors, cmdline) = identity.as_ref().map_or_else(
         |_| ("-".to_string(), "-".to_string(), "-".to_string()),
@@ -892,14 +905,18 @@ fn build_staged_transparent_denial_event(
             )
         },
     );
-    NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    let mut builder = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
         .severity(SeverityId::Medium)
         .status(StatusId::Failure)
         .dst_endpoint(transparent_destination_endpoint(destination, mapped_host))
-        .actor_process(Process::from_bypass(&binary, "-", &ancestors).with_cmd_line(&cmdline))
+        .actor_process(Process::from_bypass(&binary, "-", &ancestors).with_cmd_line(&cmdline));
+    if let Some(generation) = policy_generation {
+        builder = builder.firewall_rule_at_generation("-", "opa", generation);
+    }
+    builder
         .message(format!("Transparent TCP denied before relay: {reason}"))
         .status_detail(status_detail)
         .build()
@@ -7847,15 +7864,18 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             &open.binary_identity,
             "endpoint blocked.invalid:80 is not allowed by any policy",
             "transparent_tcp_policy_denied",
+            Some(4),
         );
         assert_eq!(
             mapped.format_shorthand(),
-            "NET:OPEN [MED] DENIED /usr/bin/curl(0) -> blocked.invalid:80 [reason:transparent_tcp_policy_denied]"
+            "NET:OPEN [MED] DENIED /usr/bin/curl(0) -> blocked.invalid:80 [policy:- engine:opa] [reason:transparent_tcp_policy_denied]"
         );
+        let mapped = serde_json::to_value(mapped).unwrap();
         assert_eq!(
-            serde_json::to_value(mapped).unwrap()["dst_endpoint"],
+            mapped["dst_endpoint"],
             serde_json::json!({"domain": "blocked.invalid", "ip": "198.18.0.2", "port": 80})
         );
+        assert_eq!(mapped["firewall_rule"]["version"], "4");
 
         let unmapped = build_staged_transparent_denial_event(
             "203.0.113.7:443".parse().unwrap(),
@@ -7863,11 +7883,14 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             &open.binary_identity,
             "endpoint 203.0.113.7:443 is not allowed by any policy",
             "transparent_tcp_policy_denied",
+            None,
         );
+        let unmapped = serde_json::to_value(unmapped).unwrap();
         assert_eq!(
-            serde_json::to_value(unmapped).unwrap()["dst_endpoint"],
+            unmapped["dst_endpoint"],
             serde_json::json!({"ip": "203.0.113.7", "port": 443})
         );
+        assert!(unmapped.get("firewall_rule").is_none());
     }
 
     #[tokio::test]
