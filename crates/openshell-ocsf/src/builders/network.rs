@@ -231,6 +231,22 @@ impl<'a, EndpointState> NetworkActivityBuilder<'a, EndpointState> {
         self
     }
 
+    /// Set the firewall rule and the policy generation that evaluated it.
+    ///
+    /// Use this for allow and deny decisions so the event names the exact
+    /// policy generation, not only the rule name.
+    #[must_use]
+    pub fn firewall_rule_at_generation(
+        mut self,
+        name: &str,
+        rule_type: &str,
+        generation: u64,
+    ) -> Self {
+        self.firewall_rule =
+            Some(FirewallRule::new(name, rule_type).with_policy_generation(generation));
+        self
+    }
+
     #[must_use]
     pub fn severity(mut self, id: SeverityId) -> Self {
         self.severity = id;
@@ -333,5 +349,28 @@ mod tests {
         assert_eq!(json["container"]["name"], "my-sandbox");
         assert_eq!(json["device"]["hostname"], "sandbox-abc123");
         assert_eq!(json["is_src_dst_assignment_known"], true);
+        assert!(
+            json["firewall_rule"].get("version").is_none(),
+            "decisions built without a generation leave firewall_rule.version unset"
+        );
+    }
+
+    #[test]
+    fn test_network_decision_records_policy_generation() {
+        let ctx = test_sandbox_context();
+        let event = NetworkActivityBuilder::new(&ctx)
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .dst_endpoint(Endpoint::from_domain("httpbin.org", 443))
+            .firewall_rule_at_generation("-", "opa", 4)
+            .message("CONNECT denied httpbin.org:443")
+            .build();
+
+        let json = event.to_json().unwrap();
+        assert_eq!(json["firewall_rule"]["name"], "-");
+        assert_eq!(json["firewall_rule"]["type"], "opa");
+        assert_eq!(json["firewall_rule"]["version"], "4");
     }
 }
